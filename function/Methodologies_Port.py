@@ -225,14 +225,14 @@ class Do_portfolio:
 
     @staticmethod
     def min_variance_weights(Sigma: pd.DataFrame,
-                             long_only: bool = True,
-                             solver: str | None = None) -> pd.Series:
+                            long_only: bool = True,
+                            solver: str | None = None) -> pd.Series:
         """
         PMV (mínima varianza sin objetivo de retorno): min w'Σw s.a. 1'w=1 (y w>=0 si long_only).
         Devuelve una Serie con los pesos (index=tickers).
         """
         tickers = list(Sigma.columns)
-        Sigma = Sigma.loc[tickers, tickers].values.astype(float)
+        Sigma_m = Sigma.loc[tickers, tickers].values.astype(float)
         n = len(tickers)
         w = cp.Variable(n)
 
@@ -240,7 +240,7 @@ class Do_portfolio:
         if long_only:
             constraints.append(w >= 0)
 
-        prob = cp.Problem(cp.Minimize(cp.quad_form(w, Sigma)), constraints)
+        prob = cp.Problem(cp.Minimize(cp.quad_form(w, Sigma_m)), constraints)
 
         if solver is None:
             installed = set(cp.installed_solvers())
@@ -249,6 +249,7 @@ class Do_portfolio:
 
         w_val = np.array(w.value).reshape(-1)
         return pd.Series(w_val, index=tickers)
+
 
     @staticmethod
     def efficient_frontier_by_return(mu: pd.Series,
@@ -281,13 +282,13 @@ class Do_portfolio:
         mu = mu.loc[tickers].astype(float)
         Sigma = Sigma.loc[tickers, tickers].astype(float)
 
-        # 1) PMV (sin restricción de retorno)
+        #  PMV (sin restricción de retorno)
         w_pmv = Do_portfolio.min_variance_weights(Sigma, long_only=long_only, solver=solver)
         mu_pmv = float(mu @ w_pmv)
         var_pmv = float(w_pmv.values @ Sigma.values @ w_pmv.values)
         vol_pmv = float(np.sqrt(max(var_pmv, 0.0)))
 
-        # 2) Construir grid de retornos objetivo
+        #  Construir grid de retornos objetivo
         mu_lo_auto = mu_pmv + 1e-8               # desde un pelo por encima del PMV
         mu_hi_auto = float(mu.max()) - 1e-8      # hasta casi el máximo individual
         if mu_targets is None:
@@ -295,7 +296,7 @@ class Do_portfolio:
                 mu_lo_auto, mu_hi_auto = float(mu.min()), float(mu.max())
             mu_targets = np.linspace(mu_lo_auto, mu_hi_auto, n_points)
 
-        # 3) Barrido usando el solver de 2.2
+        #  Barrido usando el solver de 2.2
         vols, vars_, rets, statuses = [], [], [], []
         W = []  # lista de Series con pesos
 
@@ -309,7 +310,7 @@ class Do_portfolio:
             vars_.append(res["variance"])
             W.append(res["weights"].reindex(tickers))
 
-        # 4) Empaquetar resultados
+        #  Empaquetar resultados
         curve = pd.DataFrame({
             "target_return": np.array(mu_targets, dtype=float),
             "expected_return": np.array(rets, dtype=float),
@@ -353,6 +354,149 @@ class Do_portfolio:
                                                          long_only=long_only,
                                                          solver=solver)
 
+    def pmv_info(mu: pd.Series, Sigma: pd.DataFrame,
+                 long_only: bool = True,
+                 solver: str | None = None) -> dict:
+        """Resumen del PMV: pesos, retorno, varianza, volatilidad."""
+        w = Do_portfolio.min_variance_weights(Sigma, long_only=long_only, solver=solver)
+        mu_p = float(mu @ w)
+        var_p = float(w.values @ Sigma.loc[w.index, w.index].values @ w.values)
+        vol_p = float(np.sqrt(max(var_p, 0.0)))
+        return {"weights": w, "expected_return": mu_p, "variance": var_p, "volatility": vol_p}
+
+    @staticmethod
+    def min_variance_weights_bounded(Sigma: pd.DataFrame,
+                                    lb: float = 0.0,
+                                    ub: float | None = 1.0,
+                                    solver: str | None = None) -> pd.Series:
+        """
+        PMV con cotas de peso: min w'Σw s.a. 1'w=1 y lb <= w <= ub (si ub no es None).
+        No reemplaza al método original; es una variante para evitar pesos 0.
+        """
+        tickers = list(Sigma.columns)
+        Sigma_m = Sigma.loc[tickers, tickers].values.astype(float)
+        n = len(tickers)
+        if lb * n - 1.0 > 1e-12:
+            raise ValueError(f"Infeasible: lb*n = {lb*n:.3f} > 1")
+
+        w = cp.Variable(n)
+        cons = [cp.sum(w) == 1, w >= lb]
+        if ub is not None:
+            cons.append(w <= ub)
+
+        prob = cp.Problem(cp.Minimize(cp.quad_form(w, Sigma_m)), cons)
+        if solver is None:
+            installed = set(cp.installed_solvers())
+            solver = 'OSQP' if 'OSQP' in installed else 'SCS'
+        prob.solve(solver=solver, verbose=False)
+
+        w_val = np.array(w.value).reshape(-1)
+        return pd.Series(w_val, index=tickers)
+
+    @staticmethod
+    def pmv_info_bounded(mu: pd.Series, Sigma: pd.DataFrame,
+                        lb: float = 0.01,  # ε por defecto: 1%
+                        ub: float | None = 1.0,
+                        solver: str | None = None) -> dict:
+        """
+        Resumen del PMV con cotas (evita pesos 0).
+        """
+        w = Do_portfolio.min_variance_weights_bounded(Sigma, lb=lb, ub=ub, solver=solver)
+        mu_p = float(mu @ w)
+        var_p = float(w.values @ Sigma.loc[w.index, w.index].values @ w.values)
+        vol_p = float(np.sqrt(max(var_p, 0.0)))
+        return {"weights": w, "expected_return": mu_p, "variance": var_p, "volatility": vol_p}
+    
+    @staticmethod
+    def tangency_portfolio(mu: pd.Series, Sigma: pd.DataFrame, rf_ann: float,
+                        long_only: bool = True,
+                        solver: str | None = None,
+                        frontier_points: int = 200) -> dict:
+        """
+        Portafolio tangente (máx. Sharpe). Intenta SOCP si hay solver cónico;
+        si no, hace fallback a: argmax Sharpe sobre la frontera eficiente (QP).
+        Retorna: {'status','weights','expected_return','volatility','sharpe'}.
+        """
+        tickers = list(mu.index)
+        mu = mu.loc[tickers].astype(float)
+        Sigma = Sigma.loc[tickers, tickers].astype(float)
+
+        # 1) Intento SOCP (requiere solver cónico)
+        installed = set(cp.installed_solvers())
+        preferred = ['SCS', 'ECOS', 'CLARABEL']  # cualquiera de estos sirve para SOCP
+        chosen = None
+        if solver is not None:
+            chosen = solver if solver in installed else None
+        if chosen is None:
+            for s in preferred:
+                if s in installed:
+                    chosen = s
+                    break
+
+        if chosen is not None:
+            try:
+                mu_ex = (mu - rf_ann)
+                n = len(tickers)
+                v = cp.Variable(n)
+                cons = [cp.quad_form(v, Sigma.values) <= 1]
+                if long_only:
+                    cons.append(v >= 0)
+                prob = cp.Problem(cp.Maximize(mu_ex.values @ v), cons)
+                prob.solve(solver=chosen, verbose=False)
+
+                status = prob.status
+                v_val = np.array(v.value).reshape(-1)
+                if (v_val is None) or (not np.isfinite(v_val).all()) or np.allclose(v_val.sum(), 0):
+                    raise RuntimeError("Degenerate solution from conic solver.")
+
+                w = v_val / v_val.sum()
+                w = pd.Series(w, index=tickers)
+
+                mu_p  = float(mu @ w)
+                var_p = float(w.values @ Sigma.values @ w.values)
+                vol_p = float(np.sqrt(max(var_p, 0.0)))
+                sharpe_p = (mu_p - rf_ann) / vol_p if vol_p > 0 else np.nan
+
+                return {"status": f"optimal ({chosen})", "weights": w,
+                        "expected_return": mu_p, "volatility": vol_p, "sharpe": sharpe_p}
+            except Exception as _:
+                # cae al fallback
+                pass
+
+        # 2) Fallback QP: argmax Sharpe sobre la frontera eficiente (usa OSQP si no hay cónico)
+        ef = Do_portfolio.efficient_frontier_by_return(mu=mu, Sigma=Sigma,
+                                                    n_points=frontier_points,
+                                                    long_only=long_only,
+                                                    solver='OSQP' if 'OSQP' in installed else None)
+        curve = ef["curve"]; weights = ef["weights"]
+        sharpe = (curve["expected_return"] - rf_ann) / curve["volatility"]
+        idx = int(sharpe.idxmax())
+
+        w = weights.loc[idx].reindex(tickers)
+        mu_p = float(curve.loc[idx, "expected_return"])
+        vol_p = float(curve.loc[idx, "volatility"])
+        sharpe_p = float(sharpe.loc[idx])
+
+        return {"status": "fallback_frontier_argmax", "weights": w,
+                "expected_return": mu_p, "volatility": vol_p, "sharpe": sharpe_p}
+
+
+    def tangency(self, rf_ann: float,
+                mu: pd.Series | None = None,
+                Sigma: pd.DataFrame | None = None,
+                long_only: bool = True,
+                kind: str = "log",
+                periods_per_year: int = 252,
+                solver: str | None = None) -> dict:
+        """
+        Wrapper de instancia: si no pasas mu/Sigma, los estima con los datos de la clase.
+        """
+        if (mu is None) or (Sigma is None):
+            rets = self.info.compute_returns(kind=kind)    # diarios
+            mu = rets.mean() * periods_per_year
+            Sigma = rets.cov() * periods_per_year
+        return Do_portfolio.tangency_portfolio(mu=mu, Sigma=Sigma, rf_ann=rf_ann,
+                                            long_only=long_only, solver=solver)
 
 
 ### Example ###
