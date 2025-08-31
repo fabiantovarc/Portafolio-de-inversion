@@ -9,6 +9,7 @@ from pypfopt import expected_returns
 from pypfopt.efficient_frontier.efficient_cdar import EfficientFrontier
 from pypfopt import plotting
 import cvxpy as cp
+from typing import Dict, Any
 
 
 try:
@@ -421,7 +422,7 @@ class Do_portfolio:
         mu = mu.loc[tickers].astype(float)
         Sigma = Sigma.loc[tickers, tickers].astype(float)
 
-        # 1) Intento SOCP (requiere solver cónico)
+        # Intento SOCP (requiere solver cónico)
         installed = set(cp.installed_solvers())
         preferred = ['SCS', 'ECOS', 'CLARABEL']  # cualquiera de estos sirve para SOCP
         chosen = None
@@ -463,7 +464,7 @@ class Do_portfolio:
                 # cae al fallback
                 pass
 
-        # 2) Fallback QP: argmax Sharpe sobre la frontera eficiente (usa OSQP si no hay cónico)
+        # Fallback QP: argmax Sharpe sobre la frontera eficiente (usa OSQP si no hay cónico)
         ef = Do_portfolio.efficient_frontier_by_return(mu=mu, Sigma=Sigma,
                                                     n_points=frontier_points,
                                                     long_only=long_only,
@@ -595,7 +596,7 @@ class Do_portfolio:
         filas.append(_row_from_obj("Tangente", tan_obj))
         detalles["Tangente"] = tan_obj
 
-        # 3) Markowitz con μ* (min var con retorno objetivo)
+        # Markowitz con μ* (min var con retorno objetivo)
         if include_markowitz_target:
             mu_star = float(mu.mean()) if mu_target is None else float(mu_target)
             mv_obj = Do_portfolio.min_var_portfolio(mu, Sigma, target_return=mu_star, long_only=True)
@@ -625,6 +626,300 @@ class Do_portfolio:
         tabla = tabla[[c for c in cols if c in tabla.columns]]
 
         return (tabla, detalles) if return_details else tabla
+
+
+    @staticmethod
+    def _coerce_weights(obj: Any, tickers: list[str]) -> pd.Series:
+        """
+        Convierte 'obj' en un vector de pesos (pd.Series con índice=tickers).
+        Acepta:
+        - pd.Series con índice=tickers o con claves 'w_TICKER'
+        - dict con:
+            * 'weights' (pd.Series, np.ndarray o list), o
+            * claves tipo 'w_TICKER', o
+            * claves iguales a los TICKERS
+        - np.ndarray / list con misma longitud que tickers
+        Normaliza a suma=1 y rellena faltantes con 0.
+        """
+        # Serie directa
+        if isinstance(obj, pd.Series):
+            # Si la Serie trae 'w_TICKER', construir desde ahí
+            have_prefixed = any((f"w_{t}" in obj.index) for t in tickers)
+            if have_prefixed:
+                w = pd.Series({t: obj.get(f"w_{t}", np.nan) for t in tickers},
+                            index=tickers, dtype="float64")
+            else:
+                # Si trae directamente los TICKERS como índice
+                w = obj.reindex(tickers).astype(float)
+
+        # Diccionario
+        elif isinstance(obj, dict):
+            if "weights" in obj:
+                w_raw = obj["weights"]
+                if isinstance(w_raw, pd.Series):
+                    w = w_raw.reindex(tickers).astype(float)
+                else:
+                    w_arr = np.asarray(w_raw, dtype=float).reshape(-1)
+                    assert len(w_arr) == len(tickers), "len(weights) != número de tickers"
+                    w = pd.Series(w_arr, index=tickers, dtype="float64")
+            else:
+                # a) Formato Monte Carlo: 'w_TICKER'
+                if any((f"w_{t}" in obj) for t in tickers):
+                    w = pd.Series({t: obj.get(f"w_{t}", np.nan) for t in tickers},
+                                index=tickers, dtype="float64")
+                # b) Claves = TICKERS directamente
+                elif any((t in obj) for t in tickers):
+                    w = pd.Series({t: obj.get(t, np.nan) for t in tickers},
+                                index=tickers, dtype="float64")
+                else:
+                    raise ValueError("Dict sin 'weights' ni claves w_TICKER/TICKER")
+
+        # Array/list plano
+        elif isinstance(obj, (np.ndarray, list, tuple)):
+            arr = np.asarray(obj, dtype=float).reshape(-1)
+            assert len(arr) == len(tickers), "Vector de pesos con longitud distinta a tickers"
+            w = pd.Series(arr, index=tickers, dtype="float64")
+
+        else:
+            raise ValueError("Formato de pesos no reconocido para backtest")
+
+        # Limpieza y normalización
+        w = w.astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        s = float(w.sum())
+        if not np.isfinite(s) or s <= 0:
+            raise ValueError("Suma de pesos no positiva")
+        return w / s
+
+
+
+
+    @staticmethod
+    def backtest_buy_and_hold(prices: pd.DataFrame,
+                            weights_map: Dict[str, Any],
+                            V0: float = 100_000.0) -> pd.DataFrame:
+        """
+        6.1 — Backtest buy & hold (sin rebalanceo).
+        prices: DataFrame de precios (Adj Close) indexado por fecha, columnas=tickers
+        weights_map: dict {nombre_portafolio: pesos} (acepta formatos soportados por _coerce_weights)
+        V0: valor inicial
+        Retorna: DataFrame con columnas = nombres de portafolio, valores en moneda (base V0).
+        """
+        prices = prices.sort_index().copy()
+        # Limpieza mínima: sin NaN y sin ceros en el primer día
+        prices = prices.dropna(how="any")
+        p0 = prices.iloc[0].replace(0.0, np.nan)
+        if p0.isna().any():
+            raise ValueError("Precios iniciales contienen ceros/NaN; revise el rango de backtest.")
+
+        tickers = list(prices.columns)
+        values = {}
+
+        for name, w_obj in weights_map.items():
+            w = Do_portfolio._coerce_weights(w_obj, tickers)  # Serie index=tickers
+            shares = (V0 * w) / p0                             # compra en t0
+            vals = (prices * shares).sum(axis=1)               # valuación diaria
+            values[name] = vals
+
+        return pd.DataFrame(values, index=prices.index)
+
+
+    def run_backtest(self,
+                    weights_map: Dict[str, Any],
+                    start_bt: str,
+                    end_bt: str,
+                    V0: float = 100_000.0,
+                    price_col: str = "Adj Close") -> pd.DataFrame:
+        """
+        Descarga precios del periodo de backtest y ejecuta el buy & hold para varios portafolios.
+        Reutiliza tu clase yahoo_data (no imprime ni grafica).
+        """
+        # Import explícito de la clase (evita confundir módulo/atributo)
+        from yahoo_data import yahoo_data as YahooData
+
+        # Instancia para bajar precios del backtest
+        try:
+            Ybt = YahooData(self.tickers, start=start_bt, end=end_bt, price_col=price_col)
+        except TypeError:
+            # Por compatibilidad si tu clase no acepta price_col
+            Ybt = YahooData(self.tickers, start=start_bt, end=end_bt)
+
+        prices_bt = Ybt.data.copy().sort_index().dropna(how="any")
+
+        return Do_portfolio.backtest_buy_and_hold(prices_bt, weights_map, V0=V0)
+    
+    
+    @staticmethod
+    def summarize_backtest(values: pd.DataFrame,
+                        rf_daily: Optional[pd.Series] = None,
+                        periods_per_year: int = 252) -> pd.DataFrame:
+        """
+        Resumen de métricas de backtest (buy & hold):
+        - CAGR (retorno anual compuesto realizado)
+        - Volatilidad anual realizada
+        - Sharpe (exceso vs rf_daily)
+        - Máx. Drawdown
+        - Calmar (CAGR / |MáxDD|)
+
+        Parameters
+        ----------
+        values : DataFrame de valores (columnas = portafolios)
+        rf_daily : Serie de tasa libre diaria (en proporción) alineada al índice de 'values'.
+                Si None, asume rf=0.
+        periods_per_year : 252 por defecto
+
+        Returns
+        -------
+        DataFrame con columnas: ['CAGR','AnnVol','Sharpe','MaxDD','Calmar']
+        """
+        if not isinstance(values, pd.DataFrame) or values.shape[0] < 2:
+            raise ValueError("values debe ser un DataFrame con >1 fila (serie de valores del backtest).")
+
+        values = values.sort_index()
+        rets = values.pct_change().dropna()
+
+        # rf diario alineado (si no viene, 0)
+        if rf_daily is None:
+            rf_al = pd.Series(0.0, index=rets.index)
+        else:
+            rf_al = rf_daily.reindex(rets.index).fillna(method="ffill").fillna(0.0)
+            # si viene como DataFrame de 1 columna, conviértelo a Serie
+            if isinstance(rf_al, pd.DataFrame):
+                rf_al = rf_al.squeeze()
+
+        # Métricas realizadas
+        n = rets.shape[0]
+        cagr = (values.iloc[-1] / values.iloc[0]) ** (periods_per_year / n) - 1.0
+        ann_vol = rets.std(ddof=1) * np.sqrt(periods_per_year)
+
+        # Sharpe con retorno en exceso diario (promedio * 252 / vol_anual)
+        excess = rets.sub(rf_al, axis=0)
+        sharpe = (excess.mean() * periods_per_year) / ann_vol
+        sharpe.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        # Drawdown y métricas asociadas
+        cum = (1.0 + rets).cumprod()
+        rolling_peak = cum.cummax()
+        dd = cum / rolling_peak - 1.0
+        maxdd = dd.min()  # valor negativo
+        calmar = cagr / maxdd.abs()
+        calmar.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        out = pd.DataFrame({
+            "CAGR":   cagr,
+            "AnnVol": ann_vol,
+            "Sharpe": sharpe,
+            "MaxDD":  maxdd,
+            "Calmar": calmar
+        })
+        return out
+
+
+    # utilidades de diagnóstico de backtest 
+    @staticmethod
+    def drawdown(values: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Calcula el drawdown de cada portafolio a partir de 'values' (valores monetarios).
+        Retorna:
+        - dd: DataFrame con drawdowns (negativos, 0 en máximo histórico)
+        - resumen: DataFrame con MaxDD, fecha pico, fecha valle y (si existe) fecha de recuperación
+        """
+        if not isinstance(values, pd.DataFrame) or values.shape[0] < 2:
+            raise ValueError("values debe ser DataFrame con >1 fila.")
+
+        values = values.sort_index()
+        # Normaliza por valor inicial para trabajar en múltiplos (no cambia DD)
+        cum = values.div(values.iloc[0])
+        peak = cum.cummax()
+        dd = cum / peak - 1.0  # 0 en máximos, negativo en caídas
+
+        # Resumen por columna
+        rows = []
+        for col in dd.columns:
+            s_dd = dd[col]
+            maxdd = float(s_dd.min())                  # negativo
+            t_trough = s_dd.idxmin()                   # fecha del valle
+            # pico más alto alcanzado antes del valle
+            s_cum = cum[col]
+            t_peak = s_cum.loc[:t_trough].idxmax()
+            # primera recuperación (dd >= 0) después del valle
+            s_after = s_dd.loc[t_trough:]
+            t_rec = s_after[s_after >= 0].index.min()  # puede ser NaT si no recupera
+
+            rows.append({
+                "Portafolio": col,
+                "MaxDD": maxdd,
+                "PeakDate": t_peak,
+                "TroughDate": t_trough,
+                "RecoveryDate": t_rec if pd.notna(t_rec) else pd.NaT
+            })
+
+        resumen = pd.DataFrame(rows).set_index("Portafolio")
+        return dd, resumen
+
+
+    @staticmethod
+    def rolling_stats(values: pd.DataFrame,
+                    rf_daily: pd.Series | None = None,
+                    window: int = 63,
+                    periods_per_year: int = 252,
+                    auto_shrink: bool = True,
+                    min_window: int = 10) -> dict[str, pd.DataFrame]:
+        """
+        Métricas móviles (ventana 'window'). Si auto_shrink=True y la muestra es corta,
+        reduce la ventana a min(window, len(values)-1) respetando min_window.
+        """
+        if not isinstance(values, pd.DataFrame):
+            raise ValueError("values debe ser DataFrame.")
+
+        values = values.sort_index()
+        rets = values.pct_change().dropna()
+
+        if auto_shrink:
+            max_win = max(min_window, len(rets))  # no puede superar len(rets)
+            window = int(min(window, max_win))
+        # Si aún así no alcanza, avisa
+        if len(rets) < max(2, window):
+            raise ValueError(f"Muestra insuficiente para rolling: len(rets)={len(rets)}, window={window}")
+
+        # Alinear rf diaria si viene
+        if rf_daily is None:
+            rf_al = pd.Series(0.0, index=rets.index)
+        else:
+            rf_al = rf_daily.reindex(rets.index).fillna(method="ffill").fillna(0.0)
+            if isinstance(rf_al, pd.DataFrame):
+                rf_al = rf_al.squeeze()
+
+        roll_mean = rets.rolling(window).mean()
+        roll_vol  = rets.rolling(window).std(ddof=1)
+        mu_ann    = roll_mean * periods_per_year
+        vol_ann   = roll_vol  * np.sqrt(periods_per_year)
+
+        excess    = rets.sub(rf_al, axis=0)
+        sharpe    = (excess.rolling(window).mean() * periods_per_year) / vol_ann
+        sharpe.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        return {"mu": mu_ann, "vol": vol_ann, "sharpe": sharpe}
+
+
+
+    @staticmethod
+    def dd_table(values: pd.DataFrame) -> pd.DataFrame:
+        """
+        Atajo: devuelve una tabla 'bonita' de drawdowns máximos con fechas y duración.
+        """
+        dd, res = Do_portfolio.drawdown(values)
+        # Duración pico->valle y valle->recuperación (si existiera)
+        durations = []
+        for p, row in res.iterrows():
+            peak, trough, rec = row["PeakDate"], row["TroughDate"], row["RecoveryDate"]
+            dur_down = (trough - peak).days
+            dur_recover = ((rec - trough).days if pd.notna(rec) else np.nan)
+            durations.append((dur_down, dur_recover))
+        res["Days_Peak2Trough"] = [d[0] for d in durations]
+        res["Days_Trough2Rec"]  = [d[1] for d in durations]
+        return res
+
+
 
 ### Example ###
 tickers = ['AAPL','CX','KO']
