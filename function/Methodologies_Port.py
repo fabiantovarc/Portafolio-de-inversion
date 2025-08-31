@@ -498,6 +498,133 @@ class Do_portfolio:
         return Do_portfolio.tangency_portfolio(mu=mu, Sigma=Sigma, rf_ann=rf_ann,
                                             long_only=long_only, solver=solver)
 
+    def compare_candidates_5_2(self,
+                            mu: pd.Series | None,
+                            Sigma: pd.DataFrame | None,
+                            rf_ann: float,
+                            *,
+                            include_pmv_bounded: bool = False,
+                            lb: float = 0.0,
+                            ub: float | None = 1.0,
+                            include_markowitz_target: bool = True,
+                            mu_target: float | None = None,
+                            include_mc: bool = True,
+                            n_port: int = 10000,
+                            seed: int = 42,
+                            kind: str = "log",
+                            periods_per_year: int = 252,
+                            return_details: bool = False) -> (pd.DataFrame | tuple):
+        """
+        Construye una tabla comparativa con métricas y pesos de:
+        - PMV (o PMV con cotas si include_pmv_bounded=True)
+        - Tangente (máx. Sharpe con rf_ann)
+        - Markowitz(μ*) si include_markowitz_target=True
+        - MC Max Sharpe y MC Min Vol si include_mc=True
+
+        Parámetros
+        ----------
+        mu, Sigma : anualizados. Si alguno es None, se estiman con self.info (kind, periods_per_year).
+        rf_ann : float (anual, en proporción)
+        include_pmv_bounded : si True usa lb/ub para PMV (evita pesos 0).
+        lb, ub : cotas para pesos del PMV con bound (ub=None para sin cota superior).
+        include_markowitz_target : incluye punto 2.2 con μ* (min var con retorno objetivo).
+        mu_target : si None, usa mu.mean()
+        include_mc : calcula Monte Carlo y selecciona “Max Sharpe” y “Min Vol”.
+        n_port, seed : parámetros de Monte Carlo.
+        return_details : si True retorna (tabla, dict_detalles)
+
+        Retorna
+        -------
+        tabla : pd.DataFrame con columnas ["Portafolio","μ_ann","σ_ann","Sharpe", "w_TICKER..."]
+        (opcional) detalles : dict con objetos completos utilizados para cada fila.
+        """
+        # Estimar mu/Sigma si no vienen
+        if (mu is None) or (Sigma is None):
+            rets = self.info.compute_returns(kind=kind)  # silencioso
+            mu = rets.mean() * periods_per_year
+            Sigma = rets.cov() * periods_per_year
+
+        tickers = list(mu.index)
+        weight_cols = [f"w_{t}" for t in tickers]
+
+        def _row_from_obj(name: str, obj) -> dict:
+            row = {"Portafolio": name}
+            # Nuestros métodos (pmv_info / tangency_portfolio / min_var_portfolio) devuelven dict
+            if isinstance(obj, dict) and ("expected_return" in obj) and ("volatility" in obj):
+                row["μ_ann"] = float(obj["expected_return"])
+                row["σ_ann"] = float(obj["volatility"])
+                # usar sharpe del dict si existe; si no, calcularlo
+                if "sharpe" in obj and obj["sharpe"] is not None and np.isfinite(obj["sharpe"]):
+                    row["Sharpe"] = float(obj["sharpe"])
+                else:
+                    row["Sharpe"] = float((row["μ_ann"] - rf_ann) / row["σ_ann"]) if row["σ_ann"] > 0 else np.nan
+                w = obj.get("weights", None)
+                if isinstance(w, pd.Series):
+                    for t in tickers:
+                        row[f"w_{t}"] = float(w.get(t, np.nan))
+                return row
+
+            # Filas provenientes de Monte_Carlo (Series o dict-like)
+            if hasattr(obj, "get"):
+                row["μ_ann"] = float(obj.get("ann_returns"))
+                row["σ_ann"] = float(obj.get("ann_vol"))
+                row["Sharpe"] = float(obj.get("Sharpe"))
+                for t in tickers:
+                    col = f"w_{t}"
+                    if col in obj:
+                        row[col] = float(obj.get(col))
+                return row
+
+            raise ValueError("Objeto de candidato no reconocido para la fila de 5.2")
+
+        filas = []
+        detalles = {}
+
+        # PMV (con o sin cotas)
+        if include_pmv_bounded:
+            pmv_obj = Do_portfolio.pmv_info_bounded(mu, Sigma, lb=lb, ub=ub)
+            filas.append(_row_from_obj(f"PMV (lb={lb:.2%})", pmv_obj))
+            detalles["PMV_bounded"] = pmv_obj
+        else:
+            pmv_obj = Do_portfolio.pmv_info(mu, Sigma, long_only=True)
+            filas.append(_row_from_obj("PMV", pmv_obj))
+            detalles["PMV"] = pmv_obj
+
+        # Tangente (máx Sharpe) con fallback interno si no hay solver cónico
+        tan_obj = Do_portfolio.tangency_portfolio(mu, Sigma, rf_ann=rf_ann, long_only=True)
+        filas.append(_row_from_obj("Tangente", tan_obj))
+        detalles["Tangente"] = tan_obj
+
+        # 3) Markowitz con μ* (min var con retorno objetivo)
+        if include_markowitz_target:
+            mu_star = float(mu.mean()) if mu_target is None else float(mu_target)
+            mv_obj = Do_portfolio.min_var_portfolio(mu, Sigma, target_return=mu_star, long_only=True)
+            filas.append(_row_from_obj(f"Markowitz(μ*={mu_star:.3f})", mv_obj))
+            detalles["Markowitz_mu*"] = mv_obj
+
+        # Monte Carlo → max Sharpe y min Vol
+        if include_mc:
+            mc = self.pick_candidates(n_port=n_port, short=False, rf=rf_ann, seed=seed, periods_per_year=periods_per_year)
+            filas.append(_row_from_obj("MC Max Sharpe", mc["max Sharpe"]))
+            filas.append(_row_from_obj("MC Min Vol",    mc["min Vol"]))
+            detalles["MC_max_Sharpe"] = mc["max Sharpe"]
+            detalles["MC_min_Vol"]    = mc["min Vol"]
+
+        tabla = pd.DataFrame(filas)
+
+        # Asegura tipos y orden de columnas
+        metric_cols = ["μ_ann", "σ_ann", "Sharpe"]
+        for c in metric_cols:
+            if c in tabla.columns:
+                tabla[c] = pd.to_numeric(tabla[c], errors="coerce")
+        for c in weight_cols:
+            if c in tabla.columns:
+                tabla[c] = pd.to_numeric(tabla[c], errors="coerce")
+
+        cols = ["Portafolio"] + metric_cols + weight_cols
+        tabla = tabla[[c for c in cols if c in tabla.columns]]
+
+        return (tabla, detalles) if return_details else tabla
 
 ### Example ###
 tickers = ['AAPL','CX','KO']

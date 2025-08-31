@@ -47,19 +47,23 @@ class yahoo_data:
         self.data = data.dropna(how='all')
 
     
-    def compute_returns(self, kind: str = 'log') -> pd.DataFrame:
+
+    def compute_returns(self, kind: str = 'log', verbose: bool = False) -> pd.DataFrame:
         """
-        Calcula los retornos sobre self.data (log o simples).
+        Calcula los retornos sean simples o logretornos.
+        Si verbose=True, imprime un mensaje al crearlos.
         """
         if kind == 'log':
             self.rets = np.log(self.data / self.data.shift(1))
         elif kind == 'simple':
             self.rets = self.data.pct_change()
         else:
-            raise ValueError("kind  debe ser log o simple")
+            raise ValueError('kind  debe ser log o simple')
         self.rets.dropna(inplace=True)
-        print(f'*** retornos tipo {kind} creados ***')
+        if verbose:
+            print(f'*** retornos tipo {kind} creados ***')
         return self.rets
+
 
 
     @classmethod
