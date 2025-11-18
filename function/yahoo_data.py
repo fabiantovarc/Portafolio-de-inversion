@@ -123,22 +123,40 @@ class yahoo_data:
     # conversión de ^IRX
 
     @staticmethod
-    def convert_rf(data_rf: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
+    def convert_rf(data_rf: pd.DataFrame,
+                days_per_year: int = 252,
+                kind: str = "log") -> (pd.DataFrame, pd.DataFrame):
         """
-        Convierte ^IRX (tasa anualizada en %) a:
-          - tasa anual (proporción)
-          - tasa diaria efectiva
-        Añade sufijos '_ann' y '_daily' para claridad.
+        Convierte una tasa anualizada en % (por ejemplo ^IRX) a:
+        - tasa anual en proporción (rf_ann)
+        - tasa diaria (rf_daily), que puede ser:
+            kind="simple" -> retorno simple diario
+            kind="log"    -> log-retorno diario (recomendado si los activos están en log)
         """
+        # Tasa anual en proporción (ej: 5 -> 0.05)
         rf_ann = data_rf / 100.0
-        rf_daily = (1.0 + rf_ann) ** (1.0 / 252.0) - 1.0
+
+        # Tasa diaria simple tal que (1 + rf_ann) = (1 + rf_daily_simple)^(days_per_year)
+        rf_daily_simple = (1.0 + rf_ann) ** (1.0 / days_per_year) - 1.0
+
+        if kind == "simple":
+            rf_daily = rf_daily_simple
+        elif kind == "log":
+            # log(1 + rf_daily_simple) -> log-retorno diario equivalente
+            rf_daily = np.log1p(rf_daily_simple)
+        else:
+            raise ValueError("kind debe ser 'simple' o 'log'")
 
         rf_ann = rf_ann.copy()
         rf_daily = rf_daily.copy()
 
+        # Renombrar columnas para dejar claro qué es qué
         rf_ann.columns = [f"{c}_ann" for c in rf_ann.columns]
-        rf_daily.columns = [f"{c}_daily" for c in rf_daily.columns]
+        rf_daily.columns = [f"{c}_daily_{kind}" for c in rf_daily.columns]
+
         return rf_ann, rf_daily
+
+
 
     # retornos y excesos
 
@@ -160,13 +178,21 @@ class yahoo_data:
     def excess_returns(assets_rets: pd.DataFrame, rf_daily: pd.DataFrame) -> pd.DataFrame:
         """
         Calcula retornos en exceso: activos - rf diaria (alineada y con ffill).
+
+        IMPORTANTE:
+        - assets_rets y rf_daily deben estar en el MISMO 'kind':
+            * si assets_rets son retornos simples -> rf_daily debe ser retorno simple diario
+            * si assets_rets son log-retornos    -> rf_daily debe ser log-retorno diario
         """
         rf_aligned = rf_daily.reindex(assets_rets.index).fillna(method="ffill")
-        # Si rf_daily viene con una sola columna, aplastar para broadcast correcto:
+
+        # Si rf_daily viene con una sola columna, usar esa serie
         if isinstance(rf_aligned, pd.DataFrame) and rf_aligned.shape[1] == 1:
             rf_series = rf_aligned.iloc[:, 0]
         else:
             # Si vinieran varias columnas de rf, usar la primera por convención
             rf_series = rf_aligned.iloc[:, 0]
+
         ex_rets = assets_rets.sub(rf_series, axis=0)
         return ex_rets
+
