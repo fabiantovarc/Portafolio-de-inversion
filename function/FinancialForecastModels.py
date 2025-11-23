@@ -13,7 +13,7 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 
 from arch import arch_model
 from sklearn.metrics import mean_squared_error
-
+from TimeSeriesARMA import TimeSeriesARMA
 
 class FinancialForecastModels(TimeSeriesARMA):
     """

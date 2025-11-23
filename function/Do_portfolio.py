@@ -1657,6 +1657,305 @@ class Do_portfolio:
         )
 
         return out
+    # ============================================================
+    # 7. MODELO DE TASA CORTA VASICEK + ESCENARIOS PARA MERTON
+    # ============================================================
+
+    @staticmethod
+    def vasicek_calibrate(
+        rf_series: pd.Series | pd.DataFrame,
+        dt: float = 1/252.0
+    ) -> dict:
+        """
+        Calibra un modelo de tasa corta tipo Vasicek a partir de una serie
+        histórica de tasas libres de riesgo (en proporción anual).
+
+        Supone la representación discreta (AR(1)):
+            r_{t+1} = a + b r_t + ε_t
+
+        y usa las relaciones estándar con el Vasicek continuo:
+            b = exp(-kappa * dt)
+            a = theta * (1 - exp(-kappa * dt))
+            Var(ε) = sigma^2 * (1 - exp(-2 kappa dt)) / (2 kappa)
+
+        Parámetros
+        ----------
+        rf_series : pd.Series o DataFrame (1 columna)
+            Serie de la tasa libre de riesgo en TÉRMINOS DE PROPORCIÓN ANUAL
+            (ej: 0.05 en lugar de 5).
+        dt : float
+            Paso temporal entre observaciones (en años). Para datos diarios
+            con 252 días hábiles, dt ≈ 1/252.
+
+        Devuelve
+        --------
+        dict con:
+            - 'kappa' : velocidad de reversión
+            - 'theta' : nivel de largo plazo
+            - 'sigma' : volatilidad instantánea del proceso
+            - 'a', 'b': parámetros de la forma discreta AR(1)
+        """
+        # Si viene como DataFrame, tomar la primera columna
+        if isinstance(rf_series, pd.DataFrame):
+            rf = rf_series.iloc[:, 0]
+        else:
+            rf = rf_series
+
+        # Asegurar limpieza y tipo numérico
+        rf = rf.dropna().astype(float)
+
+        # Construir variables rezagadas para estimar AR(1)
+        r_t = rf.shift(1).dropna()
+        r_tp1 = rf.iloc[1:].astype(float)  # r_{t+1}
+        r_t = r_t.loc[r_tp1.index]         # alinear índices
+
+        x = r_t.values
+        y = r_tp1.values
+        n = len(y)
+        if n < 2:
+            raise ValueError("Serie de tasas demasiado corta para calibrar Vasicek.")
+
+        # Estimación por MCO de: y = a + b x + error
+        x_mean = x.mean()
+        y_mean = y.mean()
+        denom = np.sum((x - x_mean) ** 2)
+        if denom <= 0:
+            raise ValueError("Varianza de la tasa insuficiente para calibrar Vasicek.")
+
+        b_hat = np.sum((x - x_mean) * (y - y_mean)) / denom
+        a_hat = y_mean - b_hat * x_mean
+
+        # Relación con parámetros continuos
+        if b_hat <= 0 or b_hat >= 1:
+            # En la práctica, si b_hat está fuera de (0,1) la aproximación Vasicek pierde sentido
+            # pero seguimos adelante avisando.
+            print("Advertencia: b_hat fuera de (0,1); revisar la estabilidad de la calibración.")
+
+        kappa = -np.log(b_hat) / dt
+        theta = a_hat / (1.0 - b_hat)
+
+        # Varianza de los residuos (σ_ε^2)
+        resid = y - (a_hat + b_hat * x)
+        sigma_eps2 = np.var(resid, ddof=1)
+
+        # Volatilidad instantánea del Vasicek:
+        # sigma^2 = σ_ε^2 * 2κ / (1 - b^2)
+        sigma2 = sigma_eps2 * 2.0 * kappa / (1.0 - b_hat ** 2)
+        sigma = float(np.sqrt(max(sigma2, 0.0)))
+
+        return {
+            "kappa": float(kappa),
+            "theta": float(theta),
+            "sigma": sigma,
+            "a": float(a_hat),
+            "b": float(b_hat),
+        }
+
+    @staticmethod
+    def vasicek_simulate_paths(
+        r0: float,
+        kappa: float,
+        theta: float,
+        sigma: float,
+        n_steps: int,
+        dt: float = 1/252.0,
+        n_paths: int = 1,
+        seed: int | None = None,
+        start_date: str | pd.Timestamp | None = None,
+        freq: str = "B",
+    ) -> pd.DataFrame:
+        """
+        Simula trayectorias del proceso de Vasicek:
+
+            dr_t = kappa (theta - r_t) dt + sigma dW_t
+
+        usando la solución exacta en tiempo discreto.
+
+        Parámetros
+        ----------
+        r0 : float
+            Valor inicial de la tasa corta.
+        kappa, theta, sigma : floats
+            Parámetros calibrados del modelo de Vasicek.
+        n_steps : int
+            Número de pasos a simular.
+        dt : float
+            Tamaño de cada paso en años (por ej. 1/252 para datos diarios).
+        n_paths : int
+            Número de trayectorias simuladas.
+        seed : int, opcional
+            Semilla para el generador aleatorio (reproducibilidad).
+        start_date : str o Timestamp, opcional
+            Fecha inicial para indexar la serie simulada. Si es None, se usa un índice entero.
+        freq : str
+            Frecuencia del índice de fechas (por defecto 'B' = días hábiles).
+
+        Devuelve
+        --------
+        DataFrame de tamaño (n_steps+1) x n_paths con las trayectorias de r_t.
+        """
+        rng = np.random.default_rng(seed)
+
+        # Matrices para guardar las trayectorias
+        paths = np.zeros((n_steps + 1, n_paths))
+        paths[0, :] = r0  # todas las trayectorias parten de la misma tasa inicial
+
+        # Parámetros discretizados (solución exacta del Vasicek)
+        exp_kdt = np.exp(-kappa * dt)
+        a_d = theta * (1.0 - exp_kdt)
+        sigma_d = sigma * np.sqrt((1.0 - np.exp(-2.0 * kappa * dt)) / (2.0 * kappa))
+
+        for t in range(n_steps):
+            z = rng.standard_normal(n_paths)  # choques N(0,1)
+            paths[t + 1, :] = a_d + exp_kdt * paths[t, :] + sigma_d * z
+
+        # Construir índice de tiempo (opcionalmente con fechas)
+        if start_date is not None:
+            index = pd.date_range(start=start_date, periods=n_steps + 1, freq= 彩神争霸苹果)
+        else:
+            index = pd.RangeIndex(start=0, stop=n_steps + 1, step=1)
+
+        cols = [f"path_{i}" for i in range(n_paths)]
+        return pd.DataFrame(paths, index=index, columns=cols)
+
+    def merton_vasicek_scenarios(
+        self,
+        rf_series: pd.Series | pd.DataFrame,
+        gamma: float,
+        horizonte_anios: float = 1.0,
+        n_paths: int = 1000,
+        pasos_por_anio: int = 252,
+        use_bar: bool = True,
+        kind: str = "simple",
+        periods_per_year: int = 252,
+        seed: int | None = None,
+    ) -> dict:
+        """
+        Combina:
+          - Calibración de un Vasicek a la tasa libre de riesgo,
+          - Simulación de escenarios futuros de la tasa corta,
+          - Regla de Merton (riesgo constante Σ, μ) para cada tasa simulada.
+
+        No resuelve la HJB con tasa estocástica completa, sino que usa Merton
+        con tasa "casi constante" en el horizonte, pero evaluada en tasas
+        futuras simuladas vía Vasicek. Sirve como análisis de escenarios
+        de riesgo de tasa de interés sobre el portafolio óptimo.
+
+        Parámetros
+        ----------
+        rf_series : pd.Series o DataFrame (1 columna)
+            Serie histórica de la tasa libre de riesgo en proporción anual.
+            (por ejemplo, rf_ann['^IRX_ann']).
+        gamma : float
+            Aversión al riesgo (CRRA) del inversionista.
+        horizonte_anios : float
+            Horizonte en años para simular la tasa (por ejemplo, 1.0 = 1 año).
+        n_paths : int
+            Número de trayectorias de la tasa a simular.
+        pasos_por_anio : int
+            Número de pasos de simulación por año (por ejemplo, 252).
+        use_bar : bool
+            Si True, usa self.bar_mu y self.bar_var ya calculados.
+            Si False, estima μ y Σ a partir de retornos diarios de self.info.
+        kind : {'simple','log'}
+            Tipo de retorno diario si se estiman μ y Σ internamente.
+        periods_per_year : int
+            Frecuencia de la serie de retornos (normalmente 252).
+        seed : int, opcional
+            Semilla para reproducibilidad en la simulación.
+
+        Devuelve
+        --------
+        dict con:
+          - 'params_vasicek'   : dict de parámetros calibrados (kappa, theta, sigma, a, b)
+          - 'r_paths'          : DataFrame con trayectorias simuladas de la tasa corta
+          - 'weights_paths'    : DataFrame con pesos de Merton al final del horizonte (por trayectoria)
+          - 'summary_weights'  : estadísticos descriptivos de los pesos por activo
+          - 'summary_total_risky' : estadísticos de la suma de pesos en activos riesgosos
+        """
+        # 1) Calibrar Vasicek a la serie histórica de tasas
+        params_vas = Do_portfolio.vasicek_calibrate(
+            rf_series=rf_series,
+            dt=1.0 / periods_per_year
+        )
+
+        # Extraer tasa inicial (último valor observado)
+        if isinstance(rf_series, pd.DataFrame):
+            rf_ser = rf_series.iloc[:, 0].dropna().astype(float)
+        else:
+            rf_ser = rf_series.dropna().astype(float)
+        if rf_ser.empty:
+            raise ValueError("rf_series no tiene datos válidos para usar como r0.")
+        r0 = float(rf_ser.iloc[-1])
+
+        # 2) Simular trayectorias futuras de la tasa corta
+        n_steps = int(horizonte_anios * pasos_por_anio)
+        r_paths = Do_portfolio.vasicek_simulate_paths(
+            r0=r0,
+            kappa=params_vas["kappa"],
+            theta=params_vas["theta"],
+            sigma=params_vas["sigma"],
+            n_steps=n_steps,
+            dt=1.0 / pasos_por_anio,
+            n_paths=n_paths,
+            seed=seed,
+        )
+
+        # 3) Asegurar μ y Σ anuales para Merton
+        if use_bar:
+            if (self.bar_mu is None) or (self.bar_var is None):
+                raise ValueError(
+                    "bar_mu/bar_var no definidos. Llama antes a "
+                    "mean_estimation(...) y var_estimation(...), o usa use_bar=False."
+                )
+            mu_ann = self.bar_mu.astype(float)
+            Sigma_ann = self.bar_var.astype(float)
+        else:
+            rets = self.info.compute_returns(kind=kind).dropna(how="any")
+            mu_ann = rets.mean() * periods_per_year
+            Sigma_ann = rets.cov() * periods_per_year
+            mu_ann = mu_ann.astype(float)
+            Sigma_ann = Sigma_ann.astype(float)
+
+        # 4) Calcular pesos de Merton para la tasa final de cada trayectoria
+        tickers = list(mu_ann.index)
+        mu_vec = mu_ann.loc[tickers].to_numpy(dtype=float)
+        Sigma_sub = Sigma_ann.loc[tickers, tickers].to_numpy(dtype=float)
+        Sigma_sub = 0.5 * (Sigma_sub + Sigma_sub.T)  # simetrizar por estabilidad
+
+        # Inversa de la covarianza (constante para todas las trayectorias)
+        Sigma_inv = np.linalg.inv(Sigma_sub)
+        ones = np.ones_like(mu_vec)
+
+        # Pre-cálculo para vectorizar: A = Σ^{-1} μ, B = Σ^{-1} 1
+        A = Sigma_inv @ mu_vec    # vector (n_activos,)
+        B = Sigma_inv @ ones      # vector (n_activos,)
+
+        # Tasa al final del horizonte para cada trayectoria
+        r_T = r_paths.iloc[-1, :].to_numpy(dtype=float)  # shape (n_paths,)
+
+        # Para cada trayectoria j: π_j = (A - r_T[j] * B) / gamma
+        # Construimos matriz de pesos de tamaño (n_paths x n_activos)
+        pi_mat = (A[None, :] - np.outer(r_T, B)) / float(gamma)
+
+        # DataFrame de pesos por trayectoria
+        path_index = r_paths.columns  # 'path_0', 'path_1', ...
+        weights_paths = pd.DataFrame(pi_mat, index=path_index, columns=tickers)
+
+        # 5) Estadísticos descriptivos por activo
+        summary_weights = weights_paths.describe(percentiles=[0.05, 0.50, 0.95]).T
+
+        # 6) Suma de pesos riesgosos (para ver exposición total a riesgo por trayectoria)
+        total_risky = weights_paths.sum(axis=1)
+        summary_total_risky = total_risky.describe(percentiles=[0.05, 0.50, 0.95])
+
+        return {
+            "params_vasicek": params_vas,
+            "r_paths": r_paths,
+            "weights_paths": weights_paths,
+            "summary_weights": summary_weights,
+            "summary_total_risky": summary_total_risky,
+        }
 
 
 ### Example ###
